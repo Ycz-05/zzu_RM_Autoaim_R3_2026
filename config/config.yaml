@@ -1,0 +1,5 @@
+# Gimbal configuration
+com_port: "/dev/ttyUSB0"
+
+# 你也可以在这里添加其他参数，以备将来使用
+# baud_rate: 115200

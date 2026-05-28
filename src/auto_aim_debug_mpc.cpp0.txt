@@ -1,0 +1,221 @@
+// --- START OF FILE auto_aim_debug_mpc.cpp ---
+
+#include <fmt/core.h>
+
+#include <atomic>
+#include <chrono>
+#include <nlohmann/json.hpp>
+#include <opencv2/opencv.hpp>
+#include <thread>
+
+#include "io/camera.hpp"
+#include "io/gimbal/gimbal.hpp"
+#include "tasks/auto_aim/planner/planner.hpp"
+#include "tasks/auto_aim/solver.hpp"
+#include "tasks/auto_aim/tracker.hpp"
+#include "tasks/auto_aim/yolo.hpp"
+#include "tools/exiter.hpp"
+#include "tools/img_tools.hpp"
+#include "tools/logger.hpp"
+#include "tools/math_tools.hpp"
+#include "tools/plotter.hpp"
+#include "tools/thread_safe_queue.hpp"
+
+using namespace std::chrono_literals;
+
+const std::string keys =
+  "{help h usage ? |                        | 输出命令行参数说明}"
+  "{@config-path   | configs/sentry.yaml | 位置参数，yaml配置文件路径 }";
+
+int main(int argc, char * argv[])
+{
+  tools::Exiter exiter;
+  tools::Plotter plotter;
+
+  cv::CommandLineParser cli(argc, argv, keys);
+  auto config_path = cli.get<std::string>(0);
+  if (cli.has("help") || config_path.empty()) {
+    cli.printMessage();
+    return 0;
+  }
+
+  io::Gimbal gimbal(config_path);
+  io::Camera camera(config_path);
+
+  auto_aim::YOLO yolo(config_path, true);
+  auto_aim::Solver solver(config_path);
+  auto_aim::Tracker tracker(config_path, solver);
+  auto_aim::Planner planner(config_path);
+
+  tools::ThreadSafeQueue<std::optional<auto_aim::Target>, true> target_queue(1);
+  target_queue.push(std::nullopt);
+
+  std::atomic<bool> quit = false;
+  auto plan_thread = std::thread([&]() {
+    auto t0 = std::chrono::steady_clock::now();
+    uint16_t last_bullet_count = 0;
+
+    while (!quit) {
+      auto target = target_queue.front();
+      auto gs = gimbal.state();
+      auto plan = planner.plan(target, gs.bullet_speed);
+
+      gimbal.send(
+        plan.control, plan.fire, plan.yaw, plan.yaw_vel, plan.yaw_acc, plan.pitch, plan.pitch_vel,
+        plan.pitch_acc);
+
+      auto fired = gs.bullet_count > last_bullet_count;
+      last_bullet_count = gs.bullet_count;
+
+      nlohmann::json data;
+      data["t"] = tools::delta_time(std::chrono::steady_clock::now(), t0);
+
+      data["gimbal_yaw"] = gs.yaw;
+      data["gimbal_yaw_vel"] = gs.yaw_vel;
+      data["gimbal_pitch"] = gs.pitch;
+      data["gimbal_pitch_vel"] = gs.pitch_vel;
+
+      data["target_yaw"] = plan.target_yaw;
+      data["target_pitch"] = plan.target_pitch;
+
+      data["plan_yaw"] = plan.yaw;
+      data["plan_yaw_vel"] = plan.yaw_vel;
+      data["plan_yaw_acc"] = plan.yaw_acc;
+
+      data["plan_pitch"] = plan.pitch;
+      data["plan_pitch_vel"] = plan.pitch_vel;
+      data["plan_pitch_acc"] = plan.pitch_acc;
+
+      data["fire"] = plan.fire ? 1 : 0;
+      data["fired"] = fired ? 1 : 0;
+
+      if (target.has_value()) {
+        data["target_z"] = target->ekf_x()[4];   //z
+        data["target_vz"] = target->ekf_x()[5];  //vz
+      }
+
+      if (target.has_value()) {
+        data["w"] = target->ekf_x()[7];
+      } else {
+        data["w"] = 0.0;
+      }
+
+      plotter.plot(data);
+
+      std::this_thread::sleep_for(10ms);
+    }
+  });
+
+  cv::Mat img;
+  std::chrono::steady_clock::time_point t;
+  int loop_counter = 0; // 用于控制日志输出频率
+
+  while (!exiter.exit()) {
+    loop_counter++;
+    bool verbose = (loop_counter % 20 == 0); // 每20帧打印一次
+
+    camera.read(img, t);
+    if (img.empty()) {
+        if (verbose) tools::logger()->error("[Main] Image is empty! Check camera!");
+        continue;
+    }
+
+    auto q = gimbal.q(t);
+    auto gs = gimbal.state();
+
+    // --- 调试日志：打印云台状态 ---
+    if (verbose) {
+        tools::logger()->info("[Gimbal] Yaw: {:.2f}, Pitch: {:.2f} | Q: {:.2f}, {:.2f}, {:.2f}, {:.2f} | Speed: {:.2f}", 
+            gs.yaw, gs.pitch, q.w(), q.x(), q.y(), q.z(), gs.bullet_speed);
+    }
+
+    solver.set_R_gimbal2world(q);
+    
+    // 1. YOLO 检测
+    auto armors = yolo.detect(img);
+
+    // --- 调试日志：打印识别结果 ---
+    if (verbose && armors.empty()) {
+        tools::logger()->warn("[YOLO] No armor detected.");
+    } else if (verbose) {
+        tools::logger()->info("[YOLO] Detected {} armors.", armors.size());
+    }
+
+    // --- 强制绘制：无论是否被 Tracker 选中，都画出来 ---
+    for (const auto& armor : armors) {
+        // 画出装甲板的四个顶点 (黄色)
+        for (size_t i = 0; i < 4; i++) {
+            cv::line(img, armor.points[i], armor.points[(i + 1) % 4], cv::Scalar(0, 255, 255), 2);
+        }
+        // 画出中心点
+        cv::circle(img, armor.center, 5, cv::Scalar(0, 255, 255), 2);
+        
+        // 画出装甲板的名字 (修正了这里: 使用 ARMOR_NAMES 数组)
+        // 确保 armor.name 的值在有效范围内，防止越界
+        std::string name_str = "Unknown";
+        if (armor.name >= 0 && armor.name < auto_aim::ARMOR_NAMES.size()) {
+            name_str = auto_aim::ARMOR_NAMES[armor.name];
+        }
+        cv::putText(img, name_str, armor.center, cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 255), 2);
+    }
+
+    // 2. 追踪器筛选
+    auto targets = tracker.track(armors, t);
+
+    // --- 调试日志：打印追踪结果 ---
+    if (verbose) {
+        if (targets.empty()) {
+            if (!armors.empty()) {
+                // 有识别但没追踪 -> 被过滤了！关键线索！
+                tools::logger()->warn("[Tracker] All detected armors were FILTERED out! Check color or pose.");
+            }
+        } else {
+            tools::logger()->info("[Tracker] Tracking {} targets.", targets.size());
+        }
+    }
+
+    if (!targets.empty())
+      target_queue.push(targets.front());
+    else
+      target_queue.push(std::nullopt);
+
+    if (!targets.empty()) {
+      auto target = targets.front();
+
+      // --- 调试日志：打印解算坐标 ---
+      if (verbose) {
+          auto center = target.ekf_x().head(3);
+          tools::logger()->info("[Solver] Target World Pos: x={:.2f}, y={:.2f}, z={:.2f}", center[0], center[1], center[2]);
+          if (center[2] < 0) {
+              tools::logger()->error("[Solver] Target is UNDERGROUND! Check IMU Pitch!");
+          }
+      }
+
+      // 当前帧target更新后
+      std::vector<Eigen::Vector4d> armor_xyza_list = target.armor_xyza_list();
+      for (const Eigen::Vector4d & xyza : armor_xyza_list) {
+        auto image_points =
+          solver.reproject_armor(xyza.head(3), xyza[3], target.armor_type, target.name);
+        // 追踪成功的画绿色
+        tools::draw_points(img, image_points, {0, 255, 0});
+      }
+
+      Eigen::Vector4d aim_xyza = planner.debug_xyza;
+      auto image_points =
+        solver.reproject_armor(aim_xyza.head(3), aim_xyza[3], target.armor_type, target.name);
+      // 瞄准点画红色
+      tools::draw_points(img, image_points, {0, 0, 255});
+    }
+
+    cv::resize(img, img, {}, 0.5, 0.5);  // 显示时缩小图片尺寸
+    cv::imshow("reprojection", img);
+    auto key = cv::waitKey(1);
+    if (key == 'q') break;
+  }
+
+  quit = true;
+  if (plan_thread.joinable()) plan_thread.join();
+  gimbal.send(false, false, 0, 0, 0, 0, 0, 0);
+
+  return 0;
+}

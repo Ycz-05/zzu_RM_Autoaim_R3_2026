@@ -1,0 +1,179 @@
+#include "gimbal.hpp"
+#include "uart_hd.h"   // 引入 C++ 串口驱动层
+#include <iostream>
+#include <tools/yaml.hpp> // 假设保留了yaml读取功能
+
+// 关键: 引入 C 语言的底层通信协议栈
+extern "C" {
+#include "uart.h"
+#include "DataType.h"
+}
+extern std::shared_ptr<UartLinux> uart;
+
+namespace io
+{
+
+// 构造函数实现1: 通过配置文件
+Gimbal::Gimbal(const std::string & config_path)
+{
+    // 1. 【注释掉】所有读取配置文件的代码
+    // auto yaml = tools::load(config_path);
+    // auto com_port_from_file = tools::read<std::string>(yaml, "com_port");
+
+    // 2. 【写死】直接将设备名设置为 "/dev/ttyUSB0"
+    std::string com_port = "/dev/ttyUSB0";
+    std::cout << "[Gimbal] Using hardcoded device name: " << com_port << std::endl;
+    std::cout << "[Gimbal] Ignoring config file path: " << config_path << std::endl;
+
+
+    // 3. 后续的初始化逻辑保持不变
+    
+    // 初始化C库
+    ::defUartInit();
+
+    // 初始化C++串口驱动
+    uart_driver_ = std::make_shared<UartLinux>();
+    ::uart = uart_driver_; // 将我们的实例赋给全局变量，让C代码能用
+
+    if (!uart_driver_->setUartName(com_port)) {
+        // 在实际项目中，这里应该抛出异常或记录严重错误
+        std::cerr << "FATAL: Failed to open serial port " << com_port << std::endl;
+        exit(1);
+    }
+
+    // 启动后台读取线程 (C++驱动层)
+    uart_driver_->startReading();
+
+    // 启动轮询线程 (Gimbal逻辑层)
+    is_running_ = true;
+    polling_thread_ = std::thread(&Gimbal::pollingLoop, this);
+
+    std::cout << "[Gimbal] Initialized with Seasky protocol on " << com_port << std::endl;
+}
+
+
+// 构造函数实现2: 直接通过设备名
+Gimbal::Gimbal(const std::string & device_name, int baud_rate) {
+    // (实现与上面类似，只是参数直接传入，不通过yaml读取)
+    // ... 此处省略 ...
+}
+
+Gimbal::~Gimbal()
+{
+  is_running_ = false;
+  if (polling_thread_.joinable()) {
+    polling_thread_.join();
+  }
+  uart_driver_->stopReading();
+  ::defUartDeinit(); // 清理C库资源
+  std::cout << "[Gimbal] Stopped and cleaned up." << std::endl;
+}
+
+void Gimbal::pollingLoop() {
+    // 引用 C 代码中的全局接收结构体
+    //extern Gimbal gimbal_receive;
+
+    // 记录上一次的值，只有在值变化时才更新状态
+    float last_yaw = ::gimbal_receive.yaw;
+    float last_pitch = ::gimbal_receive.pitch;
+    float last_roll = ::gimbal_receive.roll;
+
+    while (is_running_) {
+        if (::gimbal_receive.yaw != last_yaw || ::gimbal_receive.pitch != last_pitch || gimbal_receive.roll != last_roll) {
+            
+            last_yaw = ::gimbal_receive.yaw;
+            last_pitch = ::gimbal_receive.pitch;
+            last_roll = ::gimbal_receive.roll;
+
+            // 获取互斥锁，安全地更新内部状态
+            std::lock_guard<std::mutex> lock(mutex_);
+            state_.yaw = last_yaw;
+            state_.pitch = last_pitch;
+            state_.roll = last_roll;
+            // 注意：其他 state_ 成员没有被更新，因为新协议没提供
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+GimbalMode Gimbal::mode() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return mode_;
+}
+
+GimbalState Gimbal::state() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return state_;
+}
+
+std::string Gimbal::str(GimbalMode mode) const
+{
+  // 这个函数基本不需要改动
+  switch (mode) {
+    case GimbalMode::IDLE: return "IDLE";
+    case GimbalMode::AUTO_AIM: return "AUTO_AIM";
+    case GimbalMode::SMALL_BUFF: return "SMALL_BUFF";
+    case GimbalMode::BIG_BUFF: return "BIG_BUFF";
+    default: return "INVALID";
+  }
+}
+
+// ==================== API 兼容性处理 ====================
+
+Eigen::Quaterniond Gimbal::q() const
+{
+  // 1. 获取当前线程安全的云台状态
+  GimbalState current_state;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    current_state = state_;
+  }
+
+  // 2. 将角度从度转换为弧度，因为Eigen库使用弧度
+  // 注意：你需要确认下位机发送的角度是度还是弧度。这里假设是度。
+  // 如果是弧度，则不需要转换。
+  double yaw_rad = current_state.yaw * M_PI / 180.0;
+  double pitch_rad = current_state.pitch * M_PI / 180.0;
+  double roll_rad = current_state.roll * M_PI / 180.0; // 关键假设：Roll角为0
+
+  // 3. 使用欧拉角创建四元数 (ZYX 顺序)
+  // Eigen::AngleAxisd(angle, axis) 用于创建绕某轴旋转的四元数
+  // Z轴对应Yaw, Y轴对应Pitch, X轴对应Roll
+  Eigen::Quaterniond q = Eigen::AngleAxisd(yaw_rad, Eigen::Vector3d::UnitZ()) *
+                         Eigen::AngleAxisd(pitch_rad, Eigen::Vector3d::UnitY()) *
+                         Eigen::AngleAxisd(roll_rad, Eigen::Vector3d::UnitX());
+
+  return q.normalized(); // 返回归一化的四元数
+}
+
+Eigen::Quaterniond Gimbal::q(std::chrono::steady_clock::time_point t)
+    {
+        // 直接调用新的无参数版本，忽略传入的时间参数 t
+        return this->q();
+    }
+
+void Gimbal::send(
+  bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel,
+  float pitch_acc)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  if (control) {
+    mode_ = GimbalMode::AUTO_AIM;
+
+    // 更新C代码的全局发送结构体
+    // 注意：新协议只关心 yaw 和 pitch。其他参数被忽略。
+    ::gimbal_send.yaw = yaw;
+    ::gimbal_send.pitch = pitch;
+
+    // 调用C代码的发送函数
+    ::defUartSend(gimbal); // `gimbal` 是ID
+  } else {
+    mode_ = GimbalMode::IDLE;
+    // 可以选择不发送，或者发送(0,0)表示停止
+  }
+}
+
+}  // namespace io
